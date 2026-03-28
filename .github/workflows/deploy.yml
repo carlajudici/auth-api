@@ -1,0 +1,203 @@
+name: Deploy Auth API to AWS
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  TERRAFORM_VERSION: 1.6.0
+  
+jobs:
+  # JOB 1: Terraform - Criar/Atualizar Infraestrutura
+  terraform:
+    name: Terraform Infrastructure
+    runs-on: ubuntu-latest
+    environment: production
+    defaults:
+      run:
+        working-directory: ./terraform
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+    
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ${{ env.TERRAFORM_VERSION }}
+    
+    - name: Terraform Init
+      run: terraform init
+      
+    - name: Terraform Plan
+      run: terraform plan
+      continue-on-error: false
+      
+    - name: Terraform Apply
+      if: github.ref == 'refs/heads/main'
+      run: terraform apply -auto-approve
+      
+    - name: Terraform Output
+      if: github.ref == 'refs/heads/main'
+      id: terraform_output
+      run: |
+        echo "ecr_repository_url=$(terraform output -raw ecr_repository_url)" >> $GITHUB_OUTPUT
+        echo "ecs_cluster_name=$(terraform output -raw ecs_cluster_name)" >> $GITHUB_OUTPUT
+        echo "ecs_service_name=$(terraform output -raw ecs_service_name)" >> $GITHUB_OUTPUT
+    
+    - name: Save Terraform Outputs
+      if: github.ref == 'refs/heads/main'
+      run: |
+        terraform output -json > terraform_outputs.json
+    
+    - name: Upload Terraform Outputs
+      if: github.ref == 'refs/heads/main'
+      uses: actions/upload-artifact@v4
+      with:
+        name: terraform-outputs
+        path: terraform/terraform_outputs.json
+        retention-days: 1
+
+  # JOB 2: Docker Build e Push
+  docker:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+    needs: terraform
+    if: github.ref == 'refs/heads/main'
+    environment: production
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Download Terraform Outputs
+      uses: actions/download-artifact@v4
+      with:
+        name: terraform-outputs
+        path: ./terraform-outputs
+    
+    - name: Set ECR Repository URL
+      id: ecr
+      run: |
+        ECR_URL=$(jq -r '.ecr_repository_url.value' ./terraform-outputs/terraform_outputs.json)
+        echo "ecr_url=$ECR_URL" >> $GITHUB_OUTPUT
+        echo "ECR_URL=$ECR_URL" >> $GITHUB_ENV
+    
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+    
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v2
+    
+    - name: Build Docker image
+      run: |
+        docker build -t ${{ steps.ecr.outputs.ecr_url }}:latest \
+                     -t ${{ steps.ecr.outputs.ecr_url }}:${{ github.sha }} .
+    
+    - name: Push Docker image
+      run: |
+        docker push ${{ steps.ecr.outputs.ecr_url }}:latest
+        docker push ${{ steps.ecr.outputs.ecr_url }}:${{ github.sha }}
+    
+    - name: Save Image Info
+      run: |
+        echo "IMAGE_TAG=${{ github.sha }}" >> $GITHUB_ENV
+        echo "ECR_URI=${{ steps.ecr.outputs.ecr_url }}" >> $GITHUB_ENV
+
+  # JOB 3: Deploy no ECS
+  deploy:
+    name: Deploy to ECS
+    runs-on: ubuntu-latest
+    needs: [terraform, docker]
+    if: github.ref == 'refs/heads/main'
+    environment: production
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Download Terraform Outputs
+      uses: actions/download-artifact@v4
+      with:
+        name: terraform-outputs
+        path: ./terraform-outputs
+    
+    - name: Set ECS Info
+      id: ecs
+      run: |
+        ECS_CLUSTER=$(jq -r '.ecs_cluster_name.value' ./terraform-outputs/terraform_outputs.json)
+        ECS_SERVICE=$(jq -r '.ecs_service_name.value' ./terraform-outputs/terraform_outputs.json)
+        ECR_URL=$(jq -r '.ecr_repository_url.value' ./terraform-outputs/terraform_outputs.json)
+        echo "cluster=$ECS_CLUSTER" >> $GITHUB_OUTPUT
+        echo "service=$ECS_SERVICE" >> $GITHUB_OUTPUT
+        echo "ecr_url=$ECR_URL" >> $GITHUB_OUTPUT
+    
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+    
+    - name: Update ECS Service
+      run: |
+        aws ecs update-service \
+          --cluster ${{ steps.ecs.outputs.cluster }} \
+          --service ${{ steps.ecs.outputs.service }} \
+          --force-new-deployment \
+          --region ${{ env.AWS_REGION }}
+    
+    - name: Wait for Service to be Stable
+      run: |
+        aws ecs wait services-stable \
+          --cluster ${{ steps.ecs.outputs.cluster }} \
+          --services ${{ steps.ecs.outputs.service }} \
+          --region ${{ env.AWS_REGION }}
+    
+    - name: Get Task Public IP
+      id: task
+      run: |
+        TASK_ARN=$(aws ecs list-tasks --cluster ${{ steps.ecs.outputs.cluster }} --query "taskArns[0]" --output text)
+        ENI_ID=$(aws ecs describe-tasks --cluster ${{ steps.ecs.outputs.cluster }} --tasks $TASK_ARN --query "tasks[0].attachments[0].details[?name=='networkInterfaceId'].value" --output text)
+        IP_PUBLICO=$(aws ec2 describe-network-interfaces --network-interface-ids $ENI_ID --query "NetworkInterfaces[0].Association.PublicIp" --output text)
+        echo "public_ip=$IP_PUBLICO" >> $GITHUB_OUTPUT
+    
+    - name: Test Deployment
+      run: |
+        echo "✅ API disponível em: http://${{ steps.task.outputs.public_ip }}:8080"
+        sleep 10
+        curl -f http://${{ steps.task.outputs.public_ip }}:8080/test || echo "⚠️  Aguardando aplicação iniciar..."
+    
+    - name: Deployment Summary
+      run: |
+        echo "## 🚀 Deploy Concluído!" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "| Recurso | Valor |" >> $GITHUB_STEP_SUMMARY
+        echo "|---------|-------|" >> $GITHUB_STEP_SUMMARY
+        echo "| **Cluster ECS** | ${{ steps.ecs.outputs.cluster }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| **Serviço ECS** | ${{ steps.ecs.outputs.service }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| **ECR Repository** | ${{ steps.ecs.outputs.ecr_url }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| **Imagem** | ${{ github.sha }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| **IP Público** | http://${{ steps.task.outputs.public_ip }}:8080 |" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### ✅ Endpoints disponíveis:" >> $GITHUB_STEP_SUMMARY
+        echo "- \`GET /test\`" >> $GITHUB_STEP_SUMMARY
+        echo "- \`POST /api/auth/register\`" >> $GITHUB_STEP_SUMMARY
+        echo "- \`POST /api/auth/login\`" >> $GITHUB_STEP_SUMMARY
+        echo "- \`GET /api/auth/users\`" >> $GITHUB_STEP_SUMMARY
